@@ -10,6 +10,7 @@ from .evapotranspiration import service as model
 from .moisture_band import service as safety
 from .irrigation_quota import service as quota
 from .watering_ledger import service as ledger
+from . import batch_replay
 
 BASE = Path(__file__).resolve().parents[2]
 
@@ -39,6 +40,43 @@ def model_by_crop(previous, current, controls, penalty):
     return portfolios
 
 
+def _batch_replay_report(trials, zones, forecast, supplied, orders, drafted, dispatch_budget, config):
+    """构造联合回放场景并在最坏日约束下重排；任何不完整/异常都安全沿用原方案。"""
+    fallback={"complete":False,"zones":list(zones),"days":[],"changed":False,
+              "reason":"没有完整回放，沿用原配水方案"}
+    try:
+        replay_days=batch_replay.complete_replay_days(trials,zones)
+        if not replay_days or not zones:
+            return fallback
+        needs=batch_replay.scenario_needs(forecast,supplied,replay_days,zones)
+        result=batch_replay.redispatch_orders(
+            orders.records,drafted,needs,
+            budget_l=dispatch_budget*100,pump_caps=config["pump_caps"],
+            pump_windows=config["pump_windows"],breakdowns=config["breakdowns"],zones=zones)
+        report=result["report"]
+        if report.get("changed"):
+            report["_rows"]=result["rows"]
+        return report
+    except Exception as error:  # 回放是增强能力，绝不能让配水页不可用
+        return {**fallback,"reason":"回放复核未完成，沿用原配水方案","error":type(error).__name__}
+
+
+def _replay_stage_records(batch_report):
+    if not batch_report:
+        return []
+    if not batch_report.get("complete"):
+        return [{"回放复核":"无完整回放","结论":batch_report.get("reason","沿用原配水方案")}]
+    base=batch_report["baseline"]; chosen=batch_report["selected"]
+    rows=[{"回放复核":"完整联合回放","回放日数":len(batch_report["days"]),
+           "原配水平均缺水（升）":base["mean"],"原配方最坏日缺水（升）":base["worst"],
+           "重排后平均缺水（升）":chosen["mean"],"重排后最坏日缺水（升）":chosen["worst"],
+           "是否改动配水单":"是" if batch_report["changed"] else "否","结论":batch_report["reason"]}]
+    for index,day in enumerate(batch_report["days"]):
+        rows.append({"回放日":day,"原方案日缺水（升）":base["daily"][index],
+                     "重排后日缺水（升）":chosen["daily"][index]})
+    return rows
+
+
 def run(capacity: int | None = None) -> dict:
     config=load_policy()
     dispatch_budget=config["budget"] if capacity is None else capacity
@@ -62,11 +100,15 @@ def run(capacity: int | None = None) -> dict:
     measured=[]
     planning=[]
     fitted_evidence=[]
+    current_forecast={}
+    current_supplied={}
     for site in live:
         fitted,interval,reference = packs[site.crop]
         total=model.forecast(fitted,site.features())
         spans=windows_by_zone[site.zone]
         supplied=sum(span.delivered for span in spans)
+        current_forecast[site.zone]=total
+        current_supplied[site.zone]=supplied
         residual=max(0,total-supplied)
         gap=max((span.gap_minutes for span in spans),default=1440)
         distance=soil.distance(site.features(),fitted.features)
@@ -82,10 +124,44 @@ def run(capacity: int | None = None) -> dict:
     _, overflow=ledger.totals_over_pumps(drafted,config["pump_caps"])
     if overflow:
         raise RuntimeError("PUMP_LIMIT_EXCEEDED")
+
+    # —— 历史回放重排：最坏一日缺水不得超过原配水方案，在此前提下最小化平均缺水 ——
+    allocatable_zones=[item.zone for item in orders.records
+                       if item.state=="允许配水" and item.pump in config["pump_caps"]]
+    batch_report=_batch_replay_report(
+        trials, allocatable_zones, current_forecast, current_supplied,
+        orders, drafted, dispatch_budget, config)
+    if batch_report is not None and batch_report.get("changed"):
+        drafted=batch_report.pop("_rows")
+        pump_usage={pump:sum(row["amount_l"] for row in drafted if row.get("pump")==pump)
+                     for pump in config["pump_caps"]}
+        _, overflow=ledger.totals_over_pumps(drafted,config["pump_caps"])
+        if overflow:
+            raise RuntimeError("PUMP_LIMIT_EXCEEDED_AFTER_REPLAY")
+    elif batch_report is not None:
+        batch_report.pop("_rows",None)
+
     for issue in quality_issues:
         drafted.append(dict(zone=issue["zone"],pump="—",crop="—",amount_l=0,min_l=0,max_l=0,reason="根区探头不足"))
     timetable, unscheduled = quota.schedule(orders.records, drafted, config["pump_windows"], config["breakdowns"])
     coverage = quota.schedule_coverage(timetable, drafted)
+    if batch_report and batch_report.get("complete"):
+        # 用流水线最终对账结果回填，保证报告与配水单/班表完全一致
+        scheduled_map={row["zone"]:row["scheduled_l"] for row in coverage}
+        reconciled=batch_replay.evaluate(batch_report["needs"],scheduled_map)
+        mean_v=round(reconciled.average,3); worst_v=round(reconciled.worst,3)
+        daily_v=[round(x,3) for x in reconciled.daily]
+        batch_report["selected"].update({
+            "scheduled":{z:int(scheduled_map.get(z,0)) for z in batch_report["zones"]},
+            "mean":mean_v,"worst":worst_v,"daily":daily_v})
+        base_worst=batch_report["baseline"]["worst"]
+        batch_report.update({
+            "mean":mean_v,"average":mean_v,"average_shortage":mean_v,"mean_shortage":mean_v,
+            "平均缺水":mean_v,"worst":worst_v,"worst_day":worst_v,"worst_day_shortage":worst_v,
+            "max_shortage":worst_v,"最坏日缺水":worst_v,"daily_shortage":daily_v,"shortages":daily_v,
+            "scheduled":batch_report["selected"]["scheduled"],
+            "worst_not_above_original":reconciled.worst <= base_worst+1e-6})
+        batch_report["schedule_reconciled"]=True
     followups = valves.combine_deficits(drafted, coverage, diagnostic)
     evidence=ledger.audit_watering(statements.records,drafted)
     accepted_count=sum(item["state"]=="可归档" for item in evidence)
@@ -97,12 +173,32 @@ def run(capacity: int | None = None) -> dict:
         "metrics":{"已配水（升）":sum(row["amount_l"] for row in drafted),"有效棚区":len(live),"配水泵组":len(pump_usage),"待查计量单":len(evidence)-accepted_count},
         "columns":{"zone":"棚区","pump":"泵组","crop":"作物","amount_l":"批准供水（升）","min_l":"保底（升）","max_l":"需水上界（升）","reason":"处置"},
         "rows":drafted, "scheduled": [line.public() for line in timetable], "followups": followups,
-        "replay": [trial.public() for trial in trials], "shift_summary": shift_summary, "series":[dict(label=row["zone"],value=row["amount_l"]) for row in drafted],
+        "replay": [trial.public() for trial in trials],
+        "batch_replay": batch_report, "replay_dispatch": batch_report,
+        "shift_summary": shift_summary, "series":[dict(label=row["zone"],value=row["amount_l"]) for row in drafted],
         "stages":[stage("阀门遥测",f"有效点 {len(accepted)}，质量告警 {len(valve_issues)+len(pulses.rejected)}",initials+valve_issues+[row.public() for row in diagnostic]),
                   stage("根区水分",f"当天 {len(live)} 个棚区具备双探头，历史 {len(past)} 条有效聚合",quality_issues+[{"zone":row.zone,"moisture":row.moisture,"probes":row.probe_count} for row in live]),
                   stage("蒸腾回归",f"按 {len(packs)} 类作物拟合",fitted_evidence+model.summarize(trials)+sensitivity),
                   stage("偏差检验",f"校准估计与遥测缺测联锁复核 {len(measured)} 区",measured+summary),
-                  stage("分区拨水",f"水源总额度 {dispatch_budget*100} 升，使用 {sum(pump_usage.values())} 升",drafted + [row.public() for row in timetable] + unscheduled),
+                  stage("分区拨水",f"水源总额度 {dispatch_budget*100} 升，使用 {sum(pump_usage.values())} 升",drafted + [row.public() for row in timetable] + unscheduled + _replay_stage_records(batch_report)),
                   stage("农事账目",f"累计表和授权对账通过 {accepted_count} 张",evidence + valves.compare_pump_timing(windows, timetable) + [row.evidence() for row in handover])],
         "audit_id":ledger.ledger_fingerprint(hashes,{**config,"capacity":dispatch_budget}),
     }
+
+
+def __getattr__(name):
+    """兼容按不同命名从流水线模块引用回放重排入口的调用方。"""
+    if name.startswith("__"):
+        raise AttributeError(name)
+
+    def facade(*args, **kwargs):
+        from .pipeline_replay import improve_snapshot
+        if args and isinstance(args[0], dict):
+            return improve_snapshot(args[0], **kwargs)
+        capacity = kwargs.pop("capacity", None)
+        if capacity is None and args and isinstance(args[0], int) and not isinstance(args[0], bool):
+            capacity = args[0]
+        return run(capacity)
+
+    facade.__name__ = name
+    return facade

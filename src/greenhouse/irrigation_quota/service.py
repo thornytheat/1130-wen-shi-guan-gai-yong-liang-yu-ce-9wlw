@@ -46,3 +46,11 @@ def inspect(documents: Iterable[Mapping]) -> Intake:
 
 
 from .scheduling import schedule, schedule_coverage
+
+
+def __getattr__(name):
+    # 兼容把回放重排函数放在本模块命名空间下引用的测试/调用方
+    if name.startswith("__"):
+        raise AttributeError(name)
+    from .. import batch_replay as _core
+    return getattr(_core, name)

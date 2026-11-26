@@ -62,12 +62,38 @@ def overview():
 def scenario():
     try:
         body = request.get_json()
-        if not isinstance(body, dict) or set(body) != {"capacity"}:
-            raise ValueError("请提交仅包含 capacity 的 JSON 对象")
+        if not isinstance(body, dict) or "capacity" not in body:
+            raise ValueError("请提交包含 capacity 的 JSON 对象")
         capacity = parse_capacity(body["capacity"])
     except (BadRequest, UnsupportedMediaType, ValueError):
         return jsonify(code="INVALID_SCENARIO", message="请输入 1 到 100 之间的整数"), 400
     return jsonify(snapshot(capacity))
+
+
+@application.post("/api/replay")
+def replay():
+    """“重排配水”的显式回放入口；请求体可空、可仅给 capacity。"""
+    capacity = None
+    try:
+        body = request.get_json(silent=True)
+        if isinstance(body, dict) and body.get("capacity") is not None:
+            capacity = parse_capacity(body["capacity"])
+    except ValueError:
+        return jsonify(code="INVALID_SCENARIO", message="请输入 1 到 100 之间的整数"), 400
+    return jsonify(snapshot(capacity))
+
+
+@application.get("/api/replay")
+def replay_default():
+    raw_capacity = request.args.get("capacity")
+    try:
+        capacity = None if raw_capacity is None else parse_capacity(int(raw_capacity))
+    except ValueError:
+        return jsonify(code="INVALID_SCENARIO", message="请输入 1 到 100 之间的整数"), 400
+    result = initial_snapshot() if capacity is None else snapshot(capacity)
+    report = result.get("batch_replay")
+    return jsonify(run_id=result["run_id"], batch_replay=report,
+                   rows=result["rows"], scheduled=result["scheduled"])
 
 
 @application.get("/api/stages/<module>")

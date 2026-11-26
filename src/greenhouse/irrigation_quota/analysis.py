@@ -58,3 +58,11 @@ def distribute(orders, shift_l, pump_caps):
         evidence.append({"zone":item.zone,"pump":item.pump,"crop":item.crop,"amount_l":amount,
                          "min_l":target_minimum(item),"max_l":round(item.upper,1),"reason":reason})
     return evidence, dict(pump_used)
+
+
+def __getattr__(name):
+    # 兼容把回放优化函数放在拨水分析模块下引用的调用方
+    if name.startswith("__"):
+        raise AttributeError(name)
+    from .. import batch_replay as _core
+    return getattr(_core, name)

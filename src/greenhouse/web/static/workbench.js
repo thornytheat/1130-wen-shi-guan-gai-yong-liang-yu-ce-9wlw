@@ -171,10 +171,20 @@ byId('scenario').addEventListener('submit', async (event) => {
     button.disabled = true;
     announce('正在计算');
     try {
-        render(await getResult('/api/scenario', {
+        const result = await getResult('/api/scenario', {
             method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({capacity})
-        }));
-        announce('方案已更新');
+        });
+        render(result);
+        const replay = result.batch_replay;
+        if (replay && replay.complete === false) {
+            announce('没有完整回放，已沿用原配水方案');
+        } else if (replay && replay.changed) {
+            announce(`已按历史回放重排：平均缺水 ${replay.selected.mean} 升，最坏一日 ${replay.selected.worst} 升（原方案 ${replay.baseline.worst} 升，未超过原最坏值）`);
+        } else if (replay && replay.complete) {
+            announce('回放复核完成：当前额度下沿用原配水方案');
+        } else {
+            announce('方案已更新');
+        }
     } catch (error) {
         announce(error.message, true);
     } finally {
